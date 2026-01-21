@@ -1,0 +1,4 @@
+{
+    "command": "pytest",
+    "working_directory": "/tmp/kavia/workspace/code-generation/dashboard-navigation-and-user-interface-811-822/social_media_backend"
+}

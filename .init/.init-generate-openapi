@@ -1,0 +1,4 @@
+{
+    "command": "python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt && python -m src.api.generate_openapi",
+    "working_directory": "/tmp/kavia/workspace/code-generation/dashboard-navigation-and-user-interface-811-822/social_media_backend"
+}

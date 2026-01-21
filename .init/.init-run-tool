@@ -1,0 +1,4 @@
+{
+    "command": "source venv/bin/activate && uvicorn src.api.main:app --host <host> --port <port>",
+    "working_directory": "/tmp/kavia/workspace/code-generation/dashboard-navigation-and-user-interface-811-822/social_media_backend"
+}
