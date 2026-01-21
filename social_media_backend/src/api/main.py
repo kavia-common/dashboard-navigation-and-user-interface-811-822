@@ -1,65 +1,25 @@
 import os
 from datetime import datetime, timedelta
 from typing import Optional, List
-from uuid import UUID
 
 from fastapi import FastAPI, Depends, HTTPException, status, Body, Path, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import (
-    Column,
-    String,
-    Boolean,
-    TIMESTAMP,
-    text,
-    create_engine,
-    ForeignKey,
-    Text,
-    JSON,
-    Date,
-    Integer,
-    desc,
-    func,
-)
-from sqlalchemy.dialects.postgresql import UUID as PGUUID
-from sqlalchemy.orm import declarative_base, relationship, sessionmaker, Session
-from jose import JWTError, jwt
+from pydantic import BaseModel, Field, EmailStr
+from jose import jwt, JWTError
 from passlib.context import CryptContext
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
 from dotenv import load_dotenv
 
-# Load environment variables
+# Load environment variables from .env if present
 load_dotenv()
 
-# App metadata with tags
-openapi_tags = [
-    {"name": "health", "description": "Health check"},
-    {"name": "auth", "description": "Authentication endpoints"},
-    {"name": "profile", "description": "Profile management"},
-    {"name": "posts", "description": "Posts and engagements"},
-    {"name": "analytics", "description": "Analytics metrics"},
-]
-
-app = FastAPI(
-    title="Social Media Backend",
-    description="Backend for authentication, profile, posts, engagements, and analytics.",
-    version="1.0.0",
-    openapi_tags=openapi_tags,
-)
-
-# CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Database configuration
-def _build_db_url() -> str:
-    """Build database URL from env according to social_media_database/.env.example"""
-    url = os.getenv("POSTGRES_URL")
+# Configuration helpers
+def _get_db_url_from_env() -> str:
+    """Build a PostgreSQL SQLAlchemy URL from POSTGRES_* envs or POSTGRES_URL."""
+    # PUBLIC_INTERFACE
+    url = os.getenv("POSTGRES_URL", "").strip()
     if url:
         return url
     host = os.getenv("POSTGRES_HOST", "localhost")
@@ -69,116 +29,41 @@ def _build_db_url() -> str:
     db = os.getenv("POSTGRES_DB", "myapp")
     return f"postgresql+psycopg://{user}:{password}@{host}:{port}/{db}"
 
-DATABASE_URL = _build_db_url()
+def _get_cors_origins() -> List[str]:
+    raw = os.getenv("CORS_ALLOW_ORIGINS", "*")
+    if not raw:
+        return ["*"]
+    items = [o.strip() for o in raw.split(",") if o.strip()]
+    return items if items else ["*"]
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
-Base = declarative_base()
-
-# Security / JWT
-SECRET_KEY = os.getenv("JWT_SECRET", "CHANGE_ME_IN_ENV")
+JWT_SECRET = os.getenv("JWT_SECRET", "change_me")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "60"))
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
-# SQLAlchemy models to align with database schema created by sql_init.sh
-
-class User(Base):
-    __tablename__ = "users"
-    id = Column(PGUUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
-    email = Column(String, unique=True, nullable=False, index=True)
-    password_hash = Column(Text, nullable=False)
-    is_active = Column(Boolean, nullable=False, server_default=text("TRUE"))
-    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("NOW()"))
-    updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("NOW()"))
-    profile = relationship("Profile", back_populates="user", uselist=False)
-    posts = relationship("Post", back_populates="user")
-
-
-class Profile(Base):
-    __tablename__ = "profiles"
-    id = Column(PGUUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
-    user_id = Column(PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False)
-    display_name = Column(Text, nullable=False)
-    bio = Column(Text)
-    avatar_url = Column(Text)
-    location = Column(Text)
-    website = Column(Text)
-    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("NOW()"))
-    updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("NOW()"))
-    user = relationship("User", back_populates="profile")
-
-
-class Post(Base):
-    __tablename__ = "posts"
-    id = Column(PGUUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
-    user_id = Column(PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    content = Column(Text, nullable=False)
-    media_url = Column(Text)
-    visibility = Column(Text, nullable=False, server_default=text("'public'"))
-    posted_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("NOW()"))
-    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("NOW()"))
-    updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("NOW()"))
-    user = relationship("User", back_populates="posts")
-    engagements = relationship("Engagement", back_populates="post")
-
-
-class Engagement(Base):
-    __tablename__ = "engagements"
-    id = Column(PGUUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
-    post_id = Column(PGUUID(as_uuid=True), ForeignKey("posts.id", ondelete="CASCADE"), nullable=False, index=True)
-    user_id = Column(PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"))
-    type = Column(Text, nullable=False)  # like, comment, share, view
-    metadata = Column(JSON, server_default=text("'{}'::jsonb"))
-    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("NOW()"))
-    post = relationship("Post", back_populates="engagements")
-
-
-class AnalyticsDaily(Base):
-    __tablename__ = "analytics_daily"
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    metric_date = Column(Date, nullable=False)
-    user_id = Column(PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"))
-    posts_count = Column(Integer, nullable=False, server_default=text("0"))
-    likes_count = Column(Integer, nullable=False, server_default=text("0"))
-    comments_count = Column(Integer, nullable=False, server_default=text("0"))
-    shares_count = Column(Integer, nullable=False, server_default=text("0"))
-    views_count = Column(Integer, nullable=False, server_default=text("0"))
-    followers_count = Column(Integer, nullable=False, server_default=text("0"))
-    following_count = Column(Integer, nullable=False, server_default=text("0"))
-    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("NOW()"))
+# Create database engine
+DATABASE_URL = _get_db_url_from_env()
+engine: Engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
 # Pydantic Schemas
-
 class Token(BaseModel):
-    access_token: str = Field(..., description="JWT access token")
-    token_type: str = Field(..., description="Token type, always 'bearer'")
-
-class TokenData(BaseModel):
-    user_id: Optional[UUID] = None
-    email: Optional[EmailStr] = None
+    access_token: str = Field(..., description="JWT token")
+    token_type: str = Field(..., description="Token type e.g., bearer")
 
 class RegisterRequest(BaseModel):
-    email: EmailStr = Field(..., description="User email address")
-    password: str = Field(..., min_length=6, description="Password")
-
-class LoginRequest(BaseModel):
     email: EmailStr
     password: str
 
 class ProfileOut(BaseModel):
-    id: UUID
-    user_id: UUID
+    id: str
+    user_id: str
     display_name: str
     bio: Optional[str] = None
     avatar_url: Optional[str] = None
     location: Optional[str] = None
     website: Optional[str] = None
-
-    class Config:
-        from_attributes = True
 
 class ProfileUpdate(BaseModel):
     display_name: Optional[str] = None
@@ -190,22 +75,19 @@ class ProfileUpdate(BaseModel):
 class PostCreate(BaseModel):
     content: str
     media_url: Optional[str] = None
-    visibility: Optional[str] = Field(default="public")
+    visibility: Optional[str] = "public"
 
 class PostOut(BaseModel):
-    id: UUID
-    user_id: UUID
+    id: str
+    user_id: str
     content: str
     media_url: Optional[str] = None
     visibility: str
     posted_at: datetime
 
-    class Config:
-        from_attributes = True
-
 class EngagementCreate(BaseModel):
-    type: str = Field(..., description="one of like, comment, share, view")
-    metadata: Optional[dict] = Field(default=None)
+    type: str
+    metadata: Optional[dict] = None
 
 class AnalyticsSummary(BaseModel):
     metric_date: Optional[str] = None
@@ -217,253 +99,230 @@ class AnalyticsSummary(BaseModel):
     followers_count: int
     following_count: int
 
-# Utility functions
-
-def get_db():
-    """Yield DB session and ensure close."""
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-def verify_password(plain_password: str, password_hash: str) -> bool:
-    return pwd_context.verify(plain_password, password_hash)
-
-def get_password_hash(password: str) -> str:
+# Utility auth/db helpers
+def _hash_password(password: str) -> str:
     return pwd_context.hash(password)
 
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
-    to_encode = data.copy()
+def _verify_password(password: str, hashed: str) -> bool:
+    return pwd_context.verify(password, hashed)
+
+def _create_access_token(subject: str, expires_delta: Optional[timedelta] = None) -> str:
     expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    to_encode = {"sub": subject, "exp": expire}
+    return jwt.encode(to_encode, JWT_SECRET, algorithm=ALGORITHM)
 
-def get_user_by_email(db: Session, email: str) -> Optional[User]:
-    return db.query(User).filter(User.email == email).first()
+def _get_user_by_email(email: str) -> Optional[dict]:
+    with engine.connect() as conn:
+        res = conn.execute(text("SELECT id, email, password_hash, role, is_active FROM users WHERE email = :email"), {"email": email}).mappings().first()
+        return dict(res) if res else None
 
-def get_user(db: Session, user_id: UUID) -> Optional[User]:
-    return db.query(User).filter(User.id == user_id).first()
+def _get_user_by_id(user_id: str) -> Optional[dict]:
+    with engine.connect() as conn:
+        res = conn.execute(text("SELECT id, email, role, is_active FROM users WHERE id = :id"), {"id": user_id}).mappings().first()
+        return dict(res) if res else None
 
-async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
-    """Decode JWT and load current user."""
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
+def _create_user(email: str, password: str) -> dict:
+    with engine.begin() as conn:
+        res = conn.execute(
+            text("INSERT INTO users (email, password_hash, role, is_active) VALUES (:email, :hash, 'user', 1) RETURNING id, email, role, is_active"),
+            {"email": email, "hash": _hash_password(password)}
+        )
+        row = res.mappings().first()
+        # also create a profile with default display_name
+        conn.execute(
+            text("INSERT INTO profiles (user_id, display_name) VALUES (:uid, :dn)"),
+            {"uid": row["id"], "dn": email.split("@")[0]}
+        )
+        return dict(row)
+
+def _get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        uid: str = payload.get("sub")
-        if uid is None:
-            raise credentials_exception
-        token_data = TokenData(user_id=UUID(uid))
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
+        user_id = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
     except JWTError:
-        raise credentials_exception
-    user = get_user(db, token_data.user_id) if token_data.user_id else None
-    if user is None:
-        raise credentials_exception
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
+    user = _get_user_by_id(user_id)
+    if not user or not user.get("is_active"):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Inactive or missing user")
     return user
 
-# Routes
+# FastAPI app
+app = FastAPI(
+    title="Social Media Backend",
+    description="Backend for authentication, profile, posts, engagements, and analytics.",
+    version="1.0.0",
+    openapi_tags=[
+        {"name": "health", "description": "Health check"},
+        {"name": "auth", "description": "Authentication"},
+        {"name": "profile", "description": "Profile operations"},
+        {"name": "posts", "description": "Posts and engagements"},
+        {"name": "analytics", "description": "Analytics endpoints"},
+    ],
+)
 
-# PUBLIC_INTERFACE
+# Configure CORS
+origins = _get_cors_origins()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Routes
 @app.get("/", tags=["health"], summary="Health Check")
 def health_check():
-    """Health check endpoint."""
-    return {"message": "Healthy"}
+    """Health check endpoint to verify the service is running."""
+    return {"status": "ok", "time": datetime.utcnow().isoformat()}
 
-# PUBLIC_INTERFACE
 @app.post("/auth/register", response_model=Token, tags=["auth"], summary="Register a new user")
-def register(payload: RegisterRequest, db: Session = Depends(get_db)):
-    """Register a user and return JWT.
-
-    Parameters:
-    - payload: RegisterRequest containing email and password
-
-    Returns:
-    - Token: JWT bearer token for subsequent authenticated requests
-    """
-    existing = get_user_by_email(db, payload.email)
+def register(payload: RegisterRequest):
+    """Register a new user and return a JWT token."""
+    existing = _get_user_by_email(payload.email)
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
-    user = User(email=str(payload.email), password_hash=get_password_hash(payload.password))
-    db.add(user)
-    db.flush()
-    # Create default profile
-    profile = Profile(
-        user_id=user.id, display_name=payload.email.split("@")[0], bio=None, avatar_url=None
-    )
-    db.add(profile)
-    db.commit()
-    access_token = create_access_token(data={"sub": str(user.id), "email": user.email})
-    return Token(access_token=access_token, token_type="bearer")
+    user = _create_user(payload.email, payload.password)
+    access_token = _create_access_token(user["id"])
+    return {"access_token": access_token, "token_type": "bearer"}
 
-# PUBLIC_INTERFACE
 @app.post("/auth/login", response_model=Token, tags=["auth"], summary="Login and get JWT")
-def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    """Login endpoint using OAuth2PasswordRequestForm."""
-    user = get_user_by_email(db, form_data.username)
-    if not user or not verify_password(form_data.password, user.password_hash):
+def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    """
+    Login with username/password (username is email).
+    Returns a JWT bearer token if credentials are valid.
+    """
+    user = _get_user_by_email(form_data.username)
+    if not user:
         raise HTTPException(status_code=400, detail="Incorrect email or password")
-    access_token = create_access_token(data={"sub": str(user.id), "email": user.email})
-    return Token(access_token=access_token, token_type="bearer")
+    # fetch hash
+    with engine.connect() as conn:
+        row = conn.execute(text("SELECT password_hash FROM users WHERE id = :id"), {"id": user["id"]}).mappings().first()
+        if not row or not _verify_password(form_data.password, row["password_hash"]):
+            raise HTTPException(status_code=400, detail="Incorrect email or password")
+    token = _create_access_token(user["id"])
+    return {"access_token": token, "token_type": "bearer"}
 
-# PUBLIC_INTERFACE
 @app.get("/profile/me", response_model=ProfileOut, tags=["profile"], summary="Get my profile")
-def get_my_profile(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def get_my_profile(current=Depends(_get_current_user)):
     """Return the current user's profile."""
-    prof = db.query(Profile).filter(Profile.user_id == current_user.id).first()
-    if not prof:
-        raise HTTPException(status_code=404, detail="Profile not found")
-    return prof
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT id, user_id, display_name, bio, avatar_url, location, website FROM profiles WHERE user_id = :uid"),
+            {"uid": current["id"]}
+        ).mappings().first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        return dict(row)
 
-# PUBLIC_INTERFACE
 @app.put("/profile/me", response_model=ProfileOut, tags=["profile"], summary="Update my profile")
-def update_my_profile(
-    payload: ProfileUpdate,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """Update fields in the current user's profile."""
-    prof = db.query(Profile).filter(Profile.user_id == current_user.id).first()
-    if not prof:
-        # create if missing
-        prof = Profile(user_id=current_user.id, display_name="New User")
-        db.add(prof)
-        db.flush()
-    for field, value in payload.model_dump(exclude_unset=True).items():
-        setattr(prof, field, value)
-    db.commit()
-    db.refresh(prof)
-    return prof
+def update_my_profile(payload: ProfileUpdate, current=Depends(_get_current_user)):
+    """Update the current user's profile."""
+    updates = {
+        "display_name": payload.display_name,
+        "bio": payload.bio,
+        "avatar_url": payload.avatar_url,
+        "location": payload.location,
+        "website": payload.website,
+    }
+    # Build dynamic SET clause for provided fields
+    set_parts = []
+    params = {"uid": current["id"]}
+    for k, v in updates.items():
+        if v is not None:
+            set_parts.append(f"{k} = :{k}")
+            params[k] = v
+    if set_parts:
+        with engine.begin() as conn:
+            conn.execute(text(f"UPDATE profiles SET {', '.join(set_parts)} WHERE user_id = :uid"), params)
 
-# PUBLIC_INTERFACE
-@app.post("/posts", response_model=PostOut, tags=["posts"], summary="Create a post")
-def create_post(
-    payload: PostCreate,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """Create a post for the current user."""
-    post = Post(
-        user_id=current_user.id,
-        content=payload.content,
-        media_url=payload.media_url,
-        visibility=payload.visibility or "public",
-    )
-    db.add(post)
-    db.commit()
-    db.refresh(post)
-    return post
+    return get_my_profile(current=current)
 
-# PUBLIC_INTERFACE
 @app.get("/posts", response_model=List[PostOut], tags=["posts"], summary="List my posts")
-def list_my_posts(
-    limit: int = Query(20, ge=1, le=100),
-    offset: int = Query(0, ge=0),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """List posts created by current user, latest first."""
-    posts = (
-        db.query(Post)
-        .filter(Post.user_id == current_user.id)
-        .order_by(desc(Post.posted_at))
-        .offset(offset)
-        .limit(limit)
-        .all()
-    )
-    return posts
+def list_my_posts(limit: int = Query(default=20), offset: int = Query(default=0), current=Depends(_get_current_user)):
+    """List posts for the current user with pagination."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT id, user_id, content, media_url, visibility, posted_at "
+                "FROM posts WHERE user_id = :uid ORDER BY posted_at DESC LIMIT :limit OFFSET :offset"
+            ),
+            {"uid": current["id"], "limit": limit, "offset": offset}
+        ).mappings().all()
+        return [dict(r) for r in rows]
 
-# PUBLIC_INTERFACE
-@app.post(
-    "/posts/{post_id}/engagements",
-    tags=["posts"],
-    summary="Create an engagement on a post",
-    status_code=201,
-)
-def create_engagement(
-    post_id: UUID = Path(..., description="Post ID"),
-    payload: EngagementCreate = Body(...),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """Create an engagement (like, comment, share, view) for a post."""
-    post = db.query(Post).filter(Post.id == post_id).first()
-    if not post:
-        raise HTTPException(status_code=404, detail="Post not found")
-    if payload.type not in ("like", "comment", "share", "view"):
-        raise HTTPException(status_code=400, detail="Invalid engagement type")
-    engagement = Engagement(
-        post_id=post.id,
-        user_id=current_user.id,
-        type=payload.type,
-        metadata=payload.metadata or {},
-    )
-    db.add(engagement)
-    db.commit()
-    return {"status": "ok"}
-
-# PUBLIC_INTERFACE
-@app.get("/analytics/summary", response_model=AnalyticsSummary, tags=["analytics"], summary="My analytics summary")
-def analytics_summary(
-    days: int = Query(7, ge=1, le=90, description="How many recent days to aggregate"),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """Aggregate analytics_daily for current user over the last N days."""
-    since = datetime.utcnow().date() - timedelta(days=days - 1)
-    row = (
-        db.query(
-            func.coalesce(func.sum(AnalyticsDaily.posts_count), 0),
-            func.coalesce(func.sum(AnalyticsDaily.likes_count), 0),
-            func.coalesce(func.sum(AnalyticsDaily.comments_count), 0),
-            func.coalesce(func.sum(AnalyticsDaily.shares_count), 0),
-            func.coalesce(func.sum(AnalyticsDaily.views_count), 0),
-            func.coalesce(func.max(AnalyticsDaily.followers_count), 0),
-            func.coalesce(func.max(AnalyticsDaily.following_count), 0),
+@app.post("/posts", response_model=PostOut, tags=["posts"], summary="Create a post")
+def create_post(payload: PostCreate = Body(...), current=Depends(_get_current_user)):
+    """Create a new post."""
+    with engine.begin() as conn:
+        res = conn.execute(
+            text(
+                "INSERT INTO posts (user_id, content, media_url, visibility, posted_at) "
+                "VALUES (:uid, :content, :media_url, :visibility, NOW()) "
+                "RETURNING id, user_id, content, media_url, visibility, posted_at"
+            ),
+            {
+                "uid": current["id"],
+                "content": payload.content,
+                "media_url": payload.media_url,
+                "visibility": payload.visibility or "public",
+            }
         )
-        .filter(AnalyticsDaily.user_id == current_user.id)
-        .filter(AnalyticsDaily.metric_date >= since)
-        .one()
-    )
-    return AnalyticsSummary(
-        posts_count=row[0],
-        likes_count=row[1],
-        comments_count=row[2],
-        shares_count=row[3],
-        views_count=row[4],
-        followers_count=row[5],
-        following_count=row[6],
-    )
+        row = res.mappings().first()
+        return dict(row)
 
-# PUBLIC_INTERFACE
-@app.get("/analytics/daily", tags=["analytics"], summary="Daily analytics time series")
-def analytics_daily(
-    days: int = Query(7, ge=1, le=90),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+@app.post("/posts/{post_id}/engagements", status_code=201, tags=["posts"], summary="Create an engagement on a post")
+def create_engagement(
+    post_id: str = Path(..., description="Post ID (UUID)"),
+    payload: EngagementCreate = Body(...),
+    current=Depends(_get_current_user),
 ):
-    """Return the last N days of analytics_daily rows for the current user."""
-    since = datetime.utcnow().date() - timedelta(days=days - 1)
-    rows = (
-        db.query(AnalyticsDaily)
-        .filter(AnalyticsDaily.user_id == current_user.id)
-        .filter(AnalyticsDaily.metric_date >= since)
-        .order_by(AnalyticsDaily.metric_date.asc())
-        .all()
-    )
-    return [
-        AnalyticsSummary(
-            metric_date=r.metric_date.isoformat(),
-            posts_count=r.posts_count,
-            likes_count=r.likes_count,
-            comments_count=r.comments_count,
-            shares_count=r.shares_count,
-            views_count=r.views_count,
-            followers_count=r.followers_count,
-            following_count=r.following_count,
-        ).model_dump()
-        for r in rows
-    ]
+    """Create an engagement on a post (like, comment, etc.)."""
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO engagements (post_id, user_id, type, metadata, engaged_at) "
+                "VALUES (:pid, :uid, :type, :metadata, NOW())"
+            ),
+            {
+                "pid": post_id,
+                "uid": current["id"],
+                "type": payload.type,
+                "metadata": payload.metadata or {},
+            }
+        )
+    return {"status": "created"}
+
+@app.get("/analytics/summary", response_model=AnalyticsSummary, tags=["analytics"], summary="My analytics summary")
+def my_analytics_summary(days: Optional[int] = Query(default=30), current=Depends(_get_current_user)):
+    """Return aggregated analytics summary for the current user."""
+    with engine.connect() as conn:
+        # Simplified aggregation using analytics_daily table
+        res = conn.execute(
+            text(
+                "SELECT "
+                "COALESCE(SUM(posts_count),0) AS posts_count, "
+                "COALESCE(SUM(likes_count),0) AS likes_count, "
+                "COALESCE(SUM(comments_count),0) AS comments_count, "
+                "COALESCE(SUM(shares_count),0) AS shares_count, "
+                "COALESCE(SUM(views_count),0) AS views_count, "
+                "COALESCE(MAX(followers_count),0) AS followers_count, "
+                "COALESCE(MAX(following_count),0) AS following_count "
+                "FROM analytics_daily WHERE user_id = :uid AND metric_date >= CURRENT_DATE - (:days || ' days')::interval"
+            ),
+            {"uid": current["id"], "days": days or 30}
+        ).mappings().first()
+        data = dict(res) if res else {}
+    return AnalyticsSummary(**{
+        "metric_date": None,
+        "posts_count": data.get("posts_count", 0),
+        "likes_count": data.get("likes_count", 0),
+        "comments_count": data.get("comments_count", 0),
+        "shares_count": data.get("shares_count", 0),
+        "views_count": data.get("views_count", 0),
+        "followers_count": data.get("followers_count", 0),
+        "following_count": data.get("following_count", 0),
+    })
